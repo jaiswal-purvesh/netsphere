@@ -1,0 +1,97 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: netsphere
+      POSTGRES_PASSWORD: netsphere
+      POSTGRES_DB: netsphere
+    ports:
+      - "5432:5432"
+    volumes:
+      - netsphere_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netsphere"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://netsphere:netsphere@postgres:5432/netsphere
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    # Bind-mounts ./backend over the image's /app so an edit on the host is
+    # live in the container immediately — no `docker compose up --build`
+    # for a Python change, just the reload below picking it up. The image
+    # is still what gets built/shipped; this only affects local dev.
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  worker:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://netsphere:netsphere@postgres:5432/netsphere
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - backend
+    # Same source as `backend` — keep it in sync so a task-code change
+    # doesn't need a rebuild to take effect either. Note this only removes
+    # the rebuild step: Celery 5's worker has no built-in --reload/
+    # --autoreload, so pick up a code change with
+    # `docker compose restart worker`, not automatically like the backend.
+    volumes:
+      - ./backend:/app
+    command: celery -A app.worker worker --loglevel=info
+
+  frontend:
+    build: ./frontend
+    environment:
+      BACKEND_URL: http://backend:8000
+      NODE_ENV: development
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    # The image's Dockerfile runs a production build (`next build` then
+    # `next start`), which bakes routes-manifest.json at build time and
+    # can't just be bind-mounted — `next start` serves whatever was built
+    # into the image, and a raw source mount would shadow that .next
+    # output with nothing. So for local dev this overrides the command to
+    # `next dev` instead, which reads BACKEND_URL per-request and
+    # hot-reloads on every source change. node_modules and .next are
+    # named/anonymous volumes rather than part of the bind mount so the
+    # container's own (Linux) install isn't shadowed by the host's copy,
+    # e.g. if the host is macOS and has native deps built for darwin.
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+      - frontend_next_cache:/app/.next
+    command: npm run dev
+
+volumes:
+  netsphere_pgdata:
+  frontend_node_modules:
+  frontend_next_cache:

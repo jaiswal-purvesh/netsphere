@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# NetSphere operations CLI for a single-VM (RHEL) deployment.
+#   deploy/netsphere <up|down|restart|status|logs|backup|restore|update|smoke|demo|bundle|load|config>
+set -euo pipefail
+
+DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$DEPLOY_DIR/.." && pwd)"
+ENV_FILE="$DEPLOY_DIR/.env.prod"
+COMPOSE_FILE="$ROOT/docker-compose.prod.yml"
+BACKUP_DIR="${NETSPHERE_BACKUP_DIR:-$ROOT/backups}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+
+detect_engine() {
+  if [[ -n "${NETSPHERE_ENGINE:-}" ]]; then ENGINE="$NETSPHERE_ENGINE"
+  elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+  elif command -v docker >/dev/null 2>&1; then ENGINE=docker
+  else die "neither podman nor docker found (see docs/DEPLOYMENT_RHEL.md)"; fi
+
+  if [[ "$ENGINE" == docker ]]; then
+    if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose)
+    elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose)
+    else die "docker compose plugin not found"; fi
+  else
+    if podman compose version >/dev/null 2>&1; then COMPOSE=(podman compose)
+    elif command -v podman-compose >/dev/null 2>&1; then COMPOSE=(podman-compose)
+    else die "podman-compose not found (dnf install podman-compose, or pip install podman-compose)"; fi
+    export PODMAN_COMPOSE_WARNING_LOGS=false
+  fi
+  COMPOSE+=(--env-file "$ENV_FILE" -f "$COMPOSE_FILE")
+}
+
+need_env() { [[ -f "$ENV_FILE" ]] || die "$ENV_FILE missing - run deploy/install-rhel.sh first"; }
+envval() { grep -E "^$1=" "$ENV_FILE" | head -1 | cut -d= -f2- ; }
+compose() { (cd "$ROOT" && "${COMPOSE[@]}" "$@"); }
+
+pg_exec() { compose exec -T postgres "$@"; }
+
+wait_healthy() {
+  local i
+  log "waiting for the API to become healthy (first start runs migrations)..."
+  for i in $(seq 1 90); do
+    if compose exec -T backend curl -fsS http://localhost:8000/health >/dev/null 2>&1; then
+      log "backend healthy"; return 0
+    fi
+    sleep 4
+  done
+  compose logs --tail=60 backend || true
+  die "backend did not become healthy in 6 minutes"
+}
+
+cmd_up()      { compose up -d "$@"; wait_healthy; }
+cmd_build()   { compose build "$@"; }
+cmd_down()    { compose down; }
+cmd_restart() { compose restart "$@"; }
+cmd_status()  { compose ps; }
+cmd_logs()    { compose logs --tail=200 -f "$@"; }
+cmd_config()  { compose config >/dev/null && log "compose file valid"; }
+
+cmd_backup() {
+  mkdir -p "$BACKUP_DIR"
+  local out="$BACKUP_DIR/netsphere-$(date +%Y%m%d-%H%M%S).sql.gz"
+  log "dumping database -> $out"
+  pg_exec pg_dump -U netsphere --no-owner --clean --if-exists netsphere | gzip > "$out"
+  [[ -s "$out" ]] || die "backup is empty"
+  chmod 600 "$out"
+  # keep the 14 most recent
+  ls -1t "$BACKUP_DIR"/netsphere-*.sql.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
+  log "ok: $(du -h "$out" | cut -f1)  (also back up INTEGRATIONS_ENCRYPTION_KEY from $ENV_FILE - dumps are unreadable for stored secrets without it)"
+}
+
+cmd_restore() {
+  local f="${1:-}"; [[ -f "$f" ]] || die "usage: netsphere restore <backup.sql.gz>"
+  read -r -p "This REPLACES the current database with $f. Type 'yes' to continue: " a
+  [[ "$a" == yes ]] || die "aborted"
+  compose stop backend worker frontend nginx
+  gunzip -c "$f" | pg_exec psql -U netsphere -d netsphere -v ON_ERROR_STOP=1 >/dev/null
+  compose up -d
+  wait_healthy
+}
+
+cmd_update() {
+  log "backing up before update"; cmd_backup
+  log "rebuilding images"; cmd_build
+  log "restarting (migrations run on backend start)"; compose up -d
+  wait_healthy
+  cmd_smoke
+}
+
+cmd_demo() {
+  log "loading demo extras (idempotent)"
+  compose exec -T backend python -m app.seed_demo_extras
+}
+
+cmd_smoke() {
+  local port; port="$(envval HTTP_PORT)"; local base="http://127.0.0.1:$port" fail=0
+  [[ "$(envval NGINX_CONF)" == https.conf ]] && base="https://127.0.0.1:$(envval HTTPS_PORT)"
+  check() { # name url expected-code
+    local code; code=$(curl -ks -o /dev/null -w '%{http_code}' "$2" || echo 000)
+    if [[ "$code" == "$3" ]]; then echo "  PASS $1 ($code)"; else echo "  FAIL $1 (got $code, want $3)"; fail=1; fi
+  }
+  log "smoke test against $base"
+  check "UI login page"        "$base/login" 200
+  check "API health via proxy" "$base/api/v1/health" 200
+  local email pass tok
+  email="$(envval SEED_ADMIN_EMAIL)"; pass="$(envval SEED_ADMIN_PASSWORD)"
+  tok=$(curl -ks -X POST "$base/api/v1/auth/login" -H 'Content-Type: application/x-www-form-urlencoded' \
+        --data-urlencode "username=$email" --data-urlencode "password=$pass" \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)
+  if [[ -n "$tok" ]]; then echo "  PASS admin login"; else echo "  FAIL admin login"; fail=1; fi
+  if [[ -n "$tok" ]]; then
+    local code; code=$(curl -ks -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" "$base/api/v1/naming/spec")
+    [[ "$code" == 200 ]] && echo "  PASS authenticated API (naming/spec)" || { echo "  FAIL authenticated API ($code)"; fail=1; }
+  fi
+  [[ $fail == 0 ]] && log "smoke test passed" || die "smoke test failed"
+}
+
+# Offline bundle: build for linux/amd64 on any machine with docker/podman+internet,
+# copy netsphere-bundle.tar.gz to the air-gapped RHEL VM, then `netsphere load`.
+cmd_bundle() {
+  local arch="${1:-amd64}" out="${2:-$ROOT/netsphere-bundle-$arch.tar.gz}"
+  log "building images for linux/$arch"
+  local build_cmd=("$ENGINE" build --platform "linux/$arch")
+  [[ "$ENGINE" == podman ]] && build_cmd+=(--format docker)
+  local ver; ver="$(envval NETSPHERE_VERSION 2>/dev/null || echo latest)"; ver="${ver:-latest}"
+  "${build_cmd[@]}" -t "localhost/netsphere-backend:$ver" "$ROOT/backend"
+  "${build_cmd[@]}" --build-arg BACKEND_URL=http://backend:8000 -t "localhost/netsphere-frontend:$ver" "$ROOT/frontend"
+  local imgs=("localhost/netsphere-backend:$ver" "localhost/netsphere-frontend:$ver")
+  for i in docker.io/library/postgres:16 docker.io/library/redis:7-alpine docker.io/library/nginx:1.27-alpine; do
+    "$ENGINE" pull --platform "linux/$arch" "$i"; imgs+=("$i")
+  done
+  log "saving -> $out"
+  "$ENGINE" save "${imgs[@]}" | gzip > "$out"
+  log "done: $(du -h "$out" | cut -f1). Copy it plus the repo to the VM and run: deploy/netsphere load $(basename "$out")"
+}
+
+cmd_load() {
+  local f="${1:-}"; [[ -f "$f" ]] || die "usage: netsphere load <bundle.tar.gz>"
+  log "loading images from $f"
+  gunzip -c "$f" | "$ENGINE" load
+}
+
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    help|-h|--help)
+      sed -n '2,3p' "${BASH_SOURCE[0]}"; echo "  bundle [amd64|arm64]  load <file>  (offline image transfer)"; return 0;;
+  esac
+  # bundle/load don't need a running stack, but do need the engine
+  if [[ "$sub" != bundle && "$sub" != load ]]; then need_env; fi
+  detect_engine
+  case "$sub" in
+    up) cmd_up "$@";; build) cmd_build "$@";; down) cmd_down;; restart) cmd_restart "$@";;
+    status) cmd_status;; logs) cmd_logs "$@";; config) cmd_config;;
+    backup) cmd_backup;; restore) cmd_restore "$@";; update) cmd_update;;
+    smoke) cmd_smoke;; demo) cmd_demo;; bundle) cmd_bundle "$@";; load) cmd_load "$@";;
+    *) die "unknown command '$sub' (try: help)";;
+  esac
+}
+main "$@"

@@ -1,0 +1,56 @@
+fastapi==0.141.1
+uvicorn[standard]==0.46.0
+sqlalchemy==2.0.52
+alembic==1.20.0
+psycopg[binary]==3.3.5
+pydantic==2.13.3
+pydantic-settings==2.14.0
+python-jose[cryptography]==3.5.0
+celery==5.6.3
+redis==8.1.0
+python-multipart==0.0.26
+prometheus-fastapi-instrumentator==8.1.0
+bcrypt==4.2.1
+
+# Plan of Action (POA) generator (Automation module) — ported from the
+# standalone RITM-POA tool. pandas/openpyxl/python-docx/odfpy read the
+# uploaded RITM input + reference inventories (csv/xlsx/ods) and write the
+# generated Excel + Word POA, all in-memory (no filesystem paths — see
+# app/poa/README.md).
+pandas==2.3.3
+openpyxl==3.1.5
+python-docx==1.2.0
+odfpy==1.4.1
+
+# Real cloud discovery adapters (app/providers/{aws,azure,gcp,oci}.py) —
+# used only when a matching, active CloudIntegration credential is
+# configured on the Integrations page; MockAWSProvider & co. remain the
+# zero-config default. See app/providers/base.py's "no cloud-SDK import
+# outside app/providers/" rule.
+boto3==1.43.100
+azure-identity==1.25.3
+azure-mgmt-resource==26.0.0
+azure-mgmt-network==33.0.0
+azure-mgmt-subscription==3.1.1
+google-auth==2.58.0
+google-cloud-compute==1.54.0
+oci==2.187.0
+
+# POA-as-source-of-truth parser (app/services/poa_firewall_parser.py) —
+# structured/semi-structured POA ingestion formats beyond what pandas/
+# openpyxl/python-docx above already read. pypdf is for TEXT EXTRACTION from
+# an uploaded POA PDF only (never for generating one — see the pdf skill's
+# own guidance for that direction).
+PyYAML==6.0.2
+pypdf==5.1.0
+
+# test-only, kept in the same file for a single-image build; split into
+# requirements-dev.txt if the prod image ever needs to shed them.
+# No pytest-asyncio: every test in this repo is sync (FastAPI's TestClient
+# doesn't need an event loop in the test process) — it was in an earlier
+# draft of this file and never actually used; it also pins pytest<9, which
+# conflicts with the pytest==9.1.1 above and breaks `pip install` outright.
+# Add it back only if an async test is actually written, pinned to a
+# version that supports pytest 9.
+pytest==9.1.1
+httpx==0.28.1

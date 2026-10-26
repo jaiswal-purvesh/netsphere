@@ -1,0 +1,32 @@
+# secrets / local config
+.env
+deploy/.env.prod
+deploy/certs/*
+!deploy/certs/.gitkeep
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# node / next
+node_modules/
+.next/
+frontend/.next/
+next-env.d.ts
+
+# runtime artifacts
+backups/
+netsphere-bundle-*.tar.gz
+*.log
+
+# OS / editor / scratch
+.DS_Store
+.idea/
+.vscode/
+_to_delete/
+*.zip
+netsphere-deploy-update.tar.gz
